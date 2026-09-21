@@ -24,9 +24,21 @@ cross_paper 为跨卷重叠上限（kind=shared_questions）。
 （question_retain：该卷必须选入；question_remove：该卷不得选入）。
 择优在原三层之前新增第 0 层“各卷保留源卷原题总数最大化”，无解时人工编辑条件
 同样可进入最小冲突集，其 detail 可定位到卷与题号（paper + question_id）。
+
+多候选（alternative_count 2~5）：在同一冻结题库与原约束（含全部单卷约束与跨卷
+重叠上限）下迭代求解。每个候选都独立跑完整的分层择优；候选 k+1 在候选 1..k 之上
+追加两类差异约束：
+  1. 逐卷差异：其第 p 卷与此前每个候选的第 p 卷至少有 min_question_changes
+     道题不同（对称差），即“每张对应卷都要改够数量”；
+  2. 禁止重排（仅多卷）：不得与此前任何候选构成“卷序重排”关系
+     ——不存在任何卷排列使卷集合完全重合，杜绝仅靠交换卷序制造的新候选。
+差异约束只增不删、不放宽任何原始约束；后续候选一旦无解/无法在限时内判定，
+立即停止并返回实际数量与 exhausted=true。全部迭代共用同一 seed、单线程求解，
+候选顺序确定且可复现。
 """
 from __future__ import annotations
 
+from itertools import permutations
 from typing import Any, Dict, List, Optional, Tuple
 
 from ortools.sat.python import cp_model
@@ -91,6 +103,14 @@ def _prepare(
     else:
         max_shared = int(max_shared)
 
+    # 候选卷组数量（1~5，缺省 1）与候选间每张对应卷的最少差异题数
+    # （多候选缺省 1）；改卷任务始终只产 1 个候选，见 solve_revise
+    alt_count = int(req.get("alternative_count") or 1)
+    min_changes = req.get("min_question_changes")
+    min_changes = int(min_changes) if min_changes is not None else (
+        1 if alt_count >= 2 else 0
+    )
+
     d: Dict[str, Any] = {
         "questions": questions,
         "ids": ids,
@@ -108,6 +128,8 @@ def _prepare(
         "P": paper_count,
         "is_multi": is_multi,
         "max_shared": max_shared,
+        "alt_count": alt_count,
+        "min_changes": min_changes,
     }
     d["specs"] = _build_constraint_specs(d)
 
@@ -201,9 +223,13 @@ def _build_constraint_specs(d: Dict[str, Any]) -> List[Dict[str, Any]]:
 # 建模
 # --------------------------------------------------------------------------- #
 def _build_model(
-    d: Dict[str, Any], active: set
+    d: Dict[str, Any], active: set, exclusions: Optional[List[List[List[bool]]]] = None
 ) -> Tuple[cp_model.CpModel, List[List[cp_model.IntVar]], Dict[str, Any]]:
-    """联合模型：x[p][i] 表示第 p 卷是否选第 i 题。"""
+    """联合模型：x[p][i] 表示第 p 卷是否选第 i 题。
+
+    exclusions 为多候选迭代中此前各候选的选择向量（每个元素形状与 x 相同）；
+    非空时追加“每张对应卷至少改够题数 + 禁止卷序重排”的差异约束。
+    """
     m = cp_model.CpModel()
     n = len(d["questions"])
     P = d["P"]
@@ -318,7 +344,67 @@ def _build_model(
             # 人工编辑：该卷不得选入此题
             m.Add(xp[d["id_index"][spec["detail"]["question_id"]]] == 0)
 
+    # 多候选：与此前每个候选都要“逐卷改够题数”，且多卷时不得仅是卷序重排
+    for gi, prev in enumerate(exclusions or []):
+        _add_exclusion(m, d, x, prev, gi)
+
     return m, x, extra
+
+
+def _add_exclusion(
+    m: cp_model.CpModel,
+    d: Dict[str, Any],
+    x: List[List[cp_model.IntVar]],
+    prev: List[List[bool]],
+    tag: int,
+) -> None:
+    """追加候选 x 与此前候选 prev 之间的差异约束。
+
+    1) 逐卷差异（min_changes=c）：每张对应卷 p 与旧第 p 卷的对称差
+       （只有一方选入的题数）>= c。0/1 向量的对称差为
+       Σ_i (x_i + b_i - 2 x_i b_i)，用 e[r][col][i] 表示“新第 r 卷与
+       旧第 col 卷在第 i 题取值不同”来线性化；
+    2) 禁止卷序重排：不存在任何卷排列 π 使新第 r 卷与旧第 π(r) 卷逐题
+       重合，即对每个 π 要求 Σ_{r,i} e[r][π(r)][i] >= 1（一条线性子句）。
+       c>=1 时恒等排列已被 1) 排除；c=0 时恒等子句保证候选不重复，
+       非恒等子句杜绝仅交换卷序制造的新候选。
+    """
+    n = len(d["questions"])
+    P = d["P"]
+    c = d["min_changes"]
+
+    # e[r][col][i] = 1  iff  x[r][i] != prev[col][i]（新第 r 卷 vs 旧第 col 卷）
+    e: List[List[List[cp_model.IntVar]]] = [
+        [
+            [m.NewBoolVar(f"e_{tag}_{r}_{col}_{i}") for i in range(n)]
+            for col in range(P)
+        ]
+        for r in range(P)
+    ]
+    for r in range(P):
+        for col in range(P):
+            for i in range(n):
+                if prev[col][i]:
+                    # 旧卷选入：不同当且仅当新卷不选
+                    m.Add(x[r][i] == 0).OnlyEnforceIf(e[r][col][i])
+                    m.Add(x[r][i] == 1).OnlyEnforceIf(e[r][col][i].Not())
+                else:
+                    # 旧卷未选：不同当且仅当新卷选入
+                    m.Add(x[r][i] == 1).OnlyEnforceIf(e[r][col][i])
+                    m.Add(x[r][i] == 0).OnlyEnforceIf(e[r][col][i].Not())
+
+    # 1) 每张对应卷至少 c 道题不同；c=0 时仅要求候选整体不与旧候选完全相同
+    if c >= 1:
+        for r in range(P):
+            m.Add(sum(e[r][r]) >= c)
+    else:
+        m.Add(sum(e[r][r][i] for r in range(P) for i in range(n)) >= 1)
+
+    # 2) 每个非恒等卷排列下都至少有一张卷与对应旧卷不同 -> 不能靠换序造候选
+    for pi in permutations(range(P)):
+        if pi == tuple(range(P)):
+            continue
+        m.Add(sum(e[r][pi[r]][i] for r in range(P) for i in range(n)) >= 1)
 
 
 def _solver(d: Dict[str, Any]) -> cp_model.CpSolver:
@@ -333,9 +419,10 @@ def _solve(
     active: set,
     *,
     time_limit: float,
+    exclusions: Optional[List[List[List[bool]]]] = None,
 ) -> Tuple[str, Optional[List[List[bool]]]]:
     """在给定约束子集上求解，返回 (状态, 各卷选择向量)。状态 feasible/infeasible/unknown。"""
-    m, x, _ = _build_model(d, active)
+    m, x, _ = _build_model(d, active, exclusions)
     s = _solver(d)
     s.parameters.max_time_in_seconds = time_limit
     status = s.Solve(m)
@@ -397,8 +484,15 @@ def _repeat_expr(
     return sum(repeat_vars) if repeat_vars else 0
 
 
-def _optimize(d: Dict[str, Any]) -> Tuple[str, Optional[List[List[bool]]], Optional[str]]:
-    """字典序分层择优，逐阶段固定已得到的最优值。"""
+def _optimize(
+    d: Dict[str, Any],
+    exclusions: Optional[List[List[List[bool]]]] = None,
+) -> Tuple[str, Optional[List[List[bool]]], Optional[str]]:
+    """字典序分层择优，逐阶段固定已得到的最优值。
+
+    exclusions 为多候选迭代中此前各候选：在所有阶段模型中一视同仁地追加，
+    因此新候选是“与此前候选都足够不同”的解中按同一择优规则选出的最优者。
+    """
     n = len(d["questions"])
     P = d["P"]
     active = set(range(len(d["specs"])))
@@ -407,7 +501,7 @@ def _optimize(d: Dict[str, Any]) -> Tuple[str, Optional[List[List[bool]]], Optio
     # 定向改卷阶段 0：最大化各卷保留源卷原题的总数（先满足全部约束，再谈保留）
     best_retained: Optional[int] = None
     if revise:
-        m, x, extra = _build_model(d, active)
+        m, x, extra = _build_model(d, active, exclusions)
         m.Maximize(extra["retained_total"])
         s = _solver(d)
         s.parameters.max_time_in_seconds = STAGE_TIME_LIMIT
@@ -420,7 +514,7 @@ def _optimize(d: Dict[str, Any]) -> Tuple[str, Optional[List[List[bool]]], Optio
         chosen = [[bool(s.Value(x[p][i])) for i in range(n)] for p in range(P)]
 
     # 阶段 1：各卷难度偏差（单卷即其自身偏差）最小
-    m, x, extra = _build_model(d, active)
+    m, x, extra = _build_model(d, active, exclusions)
     if revise:
         m.Add(extra["retained_total"] == best_retained)
     m.Minimize(extra["total_dev"])
@@ -435,7 +529,7 @@ def _optimize(d: Dict[str, Any]) -> Tuple[str, Optional[List[List[bool]]], Optio
     chosen = [[bool(s.Value(x[p][i])) for i in range(n)] for p in range(P)]
 
     # 阶段 2：单卷最小化重复知识点数；多卷最小化跨卷重复题总数
-    m, x, extra = _build_model(d, active)
+    m, x, extra = _build_model(d, active, exclusions)
     if revise:
         m.Add(extra["retained_total"] == best_retained)
     m.Add(extra["total_dev"] == best_dev)
@@ -463,7 +557,7 @@ def _optimize(d: Dict[str, Any]) -> Tuple[str, Optional[List[List[bool]]], Optio
     total_steps = P * n_chunks_paper
     for step in range(total_steps):
         p, k = divmod(step, n_chunks_paper)
-        m, x, extra = _build_model(d, active)
+        m, x, extra = _build_model(d, active, exclusions)
         if revise:
             m.Add(extra["retained_total"] == best_retained)
         m.Add(extra["total_dev"] == best_dev)
@@ -549,8 +643,11 @@ def solve_revise(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     payload["source_request"] 为源组卷请求，payload["source_selection"] 为源任务
     各卷选中的题号（逐卷冻结），payload["edits"] 为逐卷人工编辑条件。
+    改卷始终只产 1 个候选（差异择优），忽略源请求的 alternative_count。
     """
-    base_req = payload["source_request"]
+    base_req = dict(payload["source_request"])
+    base_req["alternative_count"] = 1
+    base_req.pop("min_question_changes", None)
     d = _prepare(
         base_req,
         source_selection=payload.get("source_selection"),
@@ -564,21 +661,40 @@ def solve_revise(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _solve_prepared(d: Dict[str, Any]) -> Dict[str, Any]:
     active = set(range(len(d["specs"])))
 
-    # 快速无解预判
+    # 快速无解预判（只针对原始用户约束，与候选差异约束无关）
     reason = _quick_infeasible(d, active)
     if reason is not None:
         conflicts, note = _minimal_conflicts(d)
         return _infeasible_result(d, conflicts, note, reason)
 
-    status, chosen, note = _optimize(d)
-    if status == "feasible":
-        return _feasible_result(d, chosen)
-    if status == "unknown":
-        return {"status": "error", "error": note or "求解超时，无法判定可行性"}
+    alt_count = max(1, d.get("alt_count", 1))
+    candidates: List[List[List[bool]]] = []
+    # 迭代加入差异约束：每个候选都在原约束 + 对此前所有候选的差异约束下择优。
+    # 差异约束只增不删，绝不放宽任何原约束；某一轮无解即候选穷尽。
+    for k in range(alt_count):
+        status, chosen, note = _optimize(d, candidates)
+        if status == "feasible":
+            candidates.append(chosen)  # type: ignore[arg-type]
+            continue
+        if k == 0:
+            # 首个候选即无解：原始约束无解，给最小冲突集
+            if status == "unknown":
+                return {"status": "error", "error": note or "求解超时，无法判定可行性"}
+            conflicts, mnote = _minimal_conflicts(d)
+            return _infeasible_result(d, conflicts, mnote)
+        # 后续候选无解（或限时内无法判定）：停止迭代，返回实际数量并标记穷尽；
+        # unknown 同样保守视为穷尽，不放宽约束、不臆造候选。
+        break
 
-    # 无解：逐项删减验证最小冲突集
-    conflicts, note = _minimal_conflicts(d)
-    return _infeasible_result(d, conflicts, note)
+    if not candidates:
+        # 首个候选超时（_quick_infeasible 未预判到）
+        return {"status": "error", "error": "求解超时，无法判定可行性"}
+
+    if len(candidates) == 1 and alt_count == 1:
+        # 单候选：响应结构与旧版完全一致
+        return _feasible_result(d, candidates[0])
+
+    return _alternatives_result(d, candidates)
 
 
 def _attach_revision(
@@ -754,3 +870,35 @@ def _feasible_result(d: Dict[str, Any], chosen: List[List[bool]]) -> Dict[str, A
         "shared_question_pairs": shared_pairs,
         "seed": d["seed"],
     }
+
+
+def _alternatives_result(
+    d: Dict[str, Any], candidates: List[List[List[bool]]]
+) -> Dict[str, Any]:
+    """多候选响应：按既有择优规则排名的候选卷组数组 + 穷尽标记。
+
+    每个候选复用 _feasible_result 的完整原有统计（单卷为 selected_ids 等，
+    多卷为 papers + 跨卷统计），仅去掉 status/seed 并加 rank（从 1 起）。
+    绝不放宽约束：数量不足时 returned_count < alternative_count 且
+    exhausted=true。
+    """
+    drop_keys = {"status", "seed"}
+    alternatives: List[Dict[str, Any]] = []
+    for rank, chosen in enumerate(candidates, start=1):
+        full = _feasible_result(d, chosen)
+        alt = {k: v for k, v in full.items() if k not in drop_keys}
+        alternatives.append({"rank": rank, **alt})
+
+    result: Dict[str, Any] = {
+        "status": "feasible",
+        "alternative_count": d["alt_count"],
+        "returned_count": len(candidates),
+        "min_question_changes": d["min_changes"],
+        "exhausted": len(candidates) < d["alt_count"],
+        "alternatives": alternatives,
+        "seed": d["seed"],
+    }
+    if d["is_multi"]:
+        result["paper_count"] = d["P"]
+        result["max_shared_questions"] = d["max_shared"]
+    return result

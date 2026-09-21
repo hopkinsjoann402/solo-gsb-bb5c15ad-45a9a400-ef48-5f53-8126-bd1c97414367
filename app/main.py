@@ -26,8 +26,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="智能组卷 API",
-    description="面向教研组的题库快照约束组卷服务（FastAPI + SQLite + OR-Tools CP-SAT），支持 2~5 份平行卷联合组卷",
-    version="1.2.0",
+    description=(
+        "面向教研组的题库快照约束组卷服务（FastAPI + SQLite + OR-Tools CP-SAT），"
+        "支持 2~5 份平行卷联合组卷与 1~5 个差异化候选卷组"
+    ),
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -53,8 +56,17 @@ def create_task(payload: ExamTaskIn) -> TaskCreated:
 def _source_paper_selection(
     source_req: Dict[str, Any], source_result: Dict[str, Any]
 ) -> List[List[Any]]:
-    """从源任务结果中提取逐卷选中题号（单卷 -> 单元素列表）。"""
+    """从源任务结果中提取逐卷选中题号（单卷 -> 单元素列表）。
+
+    多候选源任务以排名第 1（择优最优）的候选为改卷基准。
+    """
     paper_count = int(source_req.get("paper_count") or 1)
+    alts = source_result.get("alternatives")
+    if alts:
+        top = min(alts, key=lambda a: a.get("rank", 1))
+        if paper_count == 1:
+            return [list(top.get("selected_ids") or [])]
+        return [list(p.get("selected_ids") or []) for p in top.get("papers") or []]
     if paper_count == 1:
         return [list(source_result.get("selected_ids") or [])]
     return [
@@ -125,7 +137,11 @@ def revise_task(task_id: int, payload: ReviseTaskIn) -> TaskCreated:
     return TaskCreated(task_id=new_task_id, status="pending")
 
 
-@app.get("/api/tasks/{task_id}", response_model=TaskStatus)
+@app.get(
+    "/api/tasks/{task_id}",
+    response_model=TaskStatus,
+    response_model_exclude_none=True,
+)
 def get_task(task_id: int) -> TaskStatus:
     """查询任务状态与组卷结果（可行卷或最小冲突约束集）。"""
     row = database.get_task(task_id)

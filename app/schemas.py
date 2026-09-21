@@ -64,6 +64,23 @@ class ExamTaskIn(BaseModel):
         ge=0,
         description="任意两卷共同题数上限，仅 paper_count>=2 时生效；缺省为 0（平行卷互不重复）",
     )
+    alternative_count: int = Field(
+        1,
+        ge=1,
+        le=5,
+        description=(
+            "候选卷组数量：同一冻结题库与原约束下按既有择优规则返回多个候选；"
+            "缺省 1，响应结构与旧版完全兼容"
+        ),
+    )
+    min_question_changes: Optional[int] = Field(
+        None,
+        ge=0,
+        description=(
+            "后续候选与此前每个候选的每张对应卷至少不同的题目数；"
+            "alternative_count>=2 时缺省 1，且不允许仅交换卷序制造新候选"
+        ),
+    )
     seed: int = Field(42, description="随机种子，保证同请求结果可复现")
 
     @field_validator("total_score")
@@ -109,6 +126,10 @@ class ExamTaskIn(BaseModel):
         # max_shared_questions 仅在多卷请求下有意义
         if self.max_shared_questions is not None and (self.paper_count or 1) < 2:
             raise ValueError("max_shared_questions 仅在 paper_count 为 2~5 时可设置")
+
+        # 多候选时 min_question_changes 缺省 1；单候选下该参数不参与求解
+        if self.alternative_count >= 2 and self.min_question_changes is None:
+            self.min_question_changes = 1
         return self
 
 
@@ -188,6 +209,32 @@ class SharedQuestionPair(BaseModel):
     question_ids: List[QuestionId] = Field(..., description="共同题编号（按题库顺序）")
 
 
+class AlternativeResult(BaseModel):
+    """单个候选卷组的组卷结果（多候选响应 alternatives 数组的元素）。
+
+    单卷任务该元素为单卷原有统计字段（selected_ids 等），多卷任务为
+    papers + 跨卷统计字段；并附 rank（从 1 起的择优排名）。
+    """
+
+    rank: int = Field(..., ge=1, description="按既有择优规则的候选排名（从 1 起）")
+
+    # —— 单卷任务：单卷原有统计 ——
+    paper: Optional[List[QuestionOut]] = None
+    selected_ids: Optional[List[QuestionId]] = None
+    total_score: Optional[int] = None
+    average_difficulty: Optional[float] = None
+    difficulty_deviation: Optional[float] = None
+    type_counts: Optional[Dict[str, int]] = None
+    knowledge_point_counts: Optional[Dict[str, int]] = None
+    repeated_knowledge_points: Optional[int] = None
+
+    # —— 多卷任务：papers + 该卷组原有跨卷统计 ——
+    papers: Optional[List[PaperResult]] = None
+    total_difficulty_deviation: Optional[float] = None
+    total_shared_questions: Optional[int] = None
+    shared_question_pairs: Optional[List[SharedQuestionPair]] = None
+
+
 class TaskResult(BaseModel):
     status: str = Field(..., description="feasible / infeasible / error")
 
@@ -213,6 +260,21 @@ class TaskResult(BaseModel):
     total_difficulty_deviation: Optional[float] = None
     total_shared_questions: Optional[int] = None
     shared_question_pairs: Optional[List[SharedQuestionPair]] = None
+
+    # —— 多候选响应（alternative_count 为 2~5）——
+    alternative_count: Optional[int] = Field(None, description="请求的候选卷组数量")
+    returned_count: Optional[int] = Field(None, description="实际返回的候选卷组数量")
+    min_question_changes: Optional[int] = Field(
+        None, description="后续候选与此前每个候选的每张对应卷至少不同的题目数（对称差）"
+    )
+    exhausted: Optional[bool] = Field(
+        None,
+        description=(
+            "候选是否已穷尽：true 表示在不放宽任何约束的前提下无法再给出更多候选"
+            "（requested_count > returned_count 时恒为 true）"
+        ),
+    )
+    alternatives: Optional[List[AlternativeResult]] = None
 
     seed: Optional[int] = None
     source_task_id: Optional[int] = Field(
