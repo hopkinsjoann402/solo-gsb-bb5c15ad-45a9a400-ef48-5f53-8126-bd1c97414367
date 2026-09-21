@@ -26,8 +26,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="智能组卷 API",
-    description="面向教研组的题库快照约束组卷服务（FastAPI + SQLite + OR-Tools CP-SAT），支持 2~5 份平行卷联合组卷",
-    version="1.2.0",
+    description=(
+        "面向教研组的题库快照约束组卷服务（FastAPI + SQLite + OR-Tools CP-SAT），"
+        "支持 2~5 份平行卷联合组卷与 1~5 个差异候选卷组（alternative_count）"
+    ),
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -81,6 +84,13 @@ def revise_task(task_id: int, payload: ReviseTaskIn) -> TaskCreated:
     source_result = json.loads(row["result"])
     if source_result.get("status") != "feasible":
         raise HTTPException(status_code=422, detail="源任务结果不可行，无法改卷")
+
+    # 改卷以单个确定的卷组为对象；多候选任务含多个并列候选，不支持直接改卷
+    if int(source_req.get("alternative_count") or 1) >= 2:
+        raise HTTPException(
+            status_code=422,
+            detail="源任务为多候选结果（alternative_count>=2），请对其中单个候选重新组卷后再改卷",
+        )
 
     paper_count = int(source_req.get("paper_count") or 1)
     id_set = {q["id"] for q in source_req["questions"]}

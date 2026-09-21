@@ -4,6 +4,8 @@
 
 支持一次请求生成 **2～5 份平行卷**（`paper_count`）：所有卷在同一个 CP-SAT 联合模型中分别满足全部单卷约束，并限制任意两卷共同题数不超过 `max_shared_questions`；多卷可行解按 **各卷难度偏差总和 → 跨卷重复题总数 → 各卷题号序列** 依次择优，无解时冲突集区分**单卷约束**（`per_paper`）与**跨卷重叠上限**（`cross_paper`）。不传 `paper_count` 时为单卷，请求与响应结构完全保持兼容。
 
+还支持一次请求返回 **1～5 个候选卷组**（`alternative_count`，默认 `1`）：在同一冻结题库与原约束下，按上述既有择优规则依次返回排序候选；后续候选的**每份对应卷**与此前**每个**候选的对应卷至少有 `min_question_changes` 道题不同（默认 1），且多卷候选之间不得仅靠交换卷序充数。差异约束只增不松，候选不足时返回实际数量与 `exhausted=true`。`alternative_count` 缺省/为 1 时响应结构与旧版完全一致。
+
 此外支持对已完成且可行的任务**定向改卷**（`POST /api/tasks/{task_id}/revise`）：按卷指定必须保留/移除的题号，联合重求解全部卷并在满足原约束的前提下**最大化各卷保留原题总数**，详见下文[定向改卷](#定向改卷post-apitaskstask_idrevise)。
 
 技术栈：Python · FastAPI · SQLite · OR-Tools CP-SAT · Docker / Compose。
@@ -68,6 +70,8 @@ curl -X POST http://localhost:8000/api/tasks \
 - `mutex_groups`：互斥题组，每组至多选取 1 题。
 - `paper_count`：平行卷份数，取 `2`～`5` 时一次生成多份卷；缺省（或 `1`）为单卷，响应结构与旧版一致。
 - `max_shared_questions`：任意两卷**共同题数上限**，仅多卷时可设置；缺省 `0`（平行卷之间不重复）。
+- `alternative_count`：候选卷组数量，取 `1`～`5`，缺省 `1`。为 `2`～`5` 时一次返回多个候选，响应见[多候选结果](#多候选结果alternative_count-为-25)；为 `1`（或缺省）时请求与响应与旧版完全兼容。
+- `min_question_changes`：多候选时后续候选的**每份对应卷**与此前每个候选的对应卷至少不同的题目数（对称差下界），正整数，缺省 `1`；仅 `alternative_count` 为 `2`～`5` 时可设置。多卷候选之间还额外禁止仅交换卷序。
 - `seed`：随机种子（默认 42），相同请求 + 相同种子结果可复现。
 
 ## 多卷请求示例（2～5 份平行卷）
@@ -156,6 +160,99 @@ curl -X POST http://localhost:8000/api/tasks \
 ```
 
 上例表示：第 2 卷（`paper: 1`）的题型数量约束与卷 2/卷 3 的零重叠上限相互冲突（题库中大题不足）；放宽其中任一条（例如允许两卷共用 1 题，或调大题量）后即可组卷。
+
+## 多候选结果（`alternative_count` 为 2～5）
+
+在任意组卷请求（单卷或多卷）上增加 `alternative_count`（与可选的 `min_question_changes`），即可在**同一冻结题库与原约束**下一次得到多个候选卷组：
+
+```bash
+curl -X POST http://localhost:8000/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "高三数学月考·候选方案",
+    "questions": [ /* ……题库快照…… */ ],
+    "total_score": 150,
+    "type_counts": {"single_choice": 8, "fill_blank": 4, "essay": 4},
+    "knowledge_coverage": {"函数": 2, "导数": 1},
+    "difficulty_range": [0.45, 0.6],
+    "target_difficulty": 0.52,
+    "alternative_count": 3,
+    "min_question_changes": 4,
+    "seed": 42
+  }'
+```
+
+求解方式：先按既有择优规则求得最优候选 `rank=0`；随后每轮在模型中**追加而绝不放宽**差异硬约束——后续候选的**每份对应卷**（卷序由多卷第 3 层对称破缺唯一确定）与此前**每个**候选的对应卷至少有 `min_question_changes` 道题不同（对称差，即新增与移除题数之和）。多卷时再对所有非恒等卷排列要求“至少一份卷不同”，因此**不能仅交换卷序制造新候选**。整个迭代沿用同一 `seed` 与单线程求解器，结果确定可复现。
+
+候选按既有择优规则全局排序：每个候选都在“原约束 ∪ 对全部此前候选的差异约束”下重新走完整分层择优，故求解顺序即排名，`rank` 从 `0` 起、`0` 为最优（其内容与单候选请求的结果完全一致）。
+
+### 多候选可行结果
+
+顶层为候选信封，`alternatives` 中每组公开其**原有统计**与 `rank`：单卷候选的每组字段与[单卷可行结果](#可行结果)一致；多卷候选的每组字段与[多卷可行结果](#多卷可行结果)一致。
+
+```json
+{
+  "status": "feasible",
+  "alternative_count": 3,
+  "returned_alternatives": 3,
+  "exhausted": false,
+  "min_question_changes": 4,
+  "alternatives": [
+    {
+      "rank": 0,
+      "selected_ids": [1, 4, 9, 13, 21],
+      "total_score": 150,
+      "average_difficulty": 0.52,
+      "difficulty_deviation": 0.0,
+      "type_counts": {"single_choice": 8, "fill_blank": 4, "essay": 4},
+      "knowledge_point_counts": {"函数": 3, "导数": 2},
+      "repeated_knowledge_points": 1,
+      "paper": [ /* 完整题目对象 */ ]
+    },
+    { "rank": 1, "selected_ids": [2, 4, 9, 14, 22], "total_score": 150 }
+  ],
+  "seed": 42
+}
+```
+
+多卷时每个候选组内为多卷字段（`papers`、`total_difficulty_deviation`、`total_shared_questions`、`shared_question_pairs` 等），结构与单组多卷结果一致：
+
+```json
+{
+  "status": "feasible",
+  "alternative_count": 3,
+  "returned_alternatives": 2,
+  "exhausted": true,
+  "min_question_changes": 1,
+  "alternatives": [
+    {
+      "rank": 0,
+      "paper_count": 2,
+      "max_shared_questions": 0,
+      "papers": [
+        {"selected_ids": [1, 2, 8, 11, 17], "total_score": 150},
+        {"selected_ids": [7, 9, 12, 16, 23], "total_score": 150}
+      ],
+      "total_difficulty_deviation": 0.04,
+      "total_shared_questions": 0,
+      "shared_question_pairs": [
+        {"papers": [0, 1], "count": 0, "question_ids": []}
+      ]
+    },
+    { "rank": 1, "paper_count": 2, "papers": [ "/* 与 rank=0 的每份对应卷至少 1 题不同，且不是卷序交换 */" ] }
+  ],
+  "seed": 42
+}
+```
+
+字段说明：
+
+- `alternative_count`：请求的候选数量；`returned_alternatives`：实际返回数量。
+- `exhausted`：在原约束与全部差异约束下继续迭代是否已被求解器证明不可行。候选不足（`returned_alternatives < alternative_count`）时为 `true`；**服务不会放宽任何约束**去凑数。若迭代因求解超时无法判定是否还有候选，则返回已求得的候选、`exhausted` 为 `false` 并附 `message` 说明。
+- `min_question_changes`：本次生效的逐对应卷最小差异题数。
+- 若连第 0 个候选都不可行（原约束本身无解），响应为常规 `infeasible` 结构并附最小冲突约束集，同时带 `returned_alternatives: 0`、`exhausted: true`。
+
+> 多候选任务不支持直接改卷（`revise`）：请对其中单个候选按其题号重新发起单候选组卷后再改卷；对多候选任务调用改卷接口返回 `422`。
 
 ## 定向改卷（`POST /api/tasks/{task_id}/revise`）
 
